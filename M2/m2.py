@@ -1281,6 +1281,25 @@ USER_MODELS_DIR = BASE_DIR / "data" / "user_svm_models"
 USER_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 EMS_DATA_PATH = BASE_DIR / "data" / "ems_songs.csv"
 
+# DB 세션
+from app.database import SessionLocal
+
+
+def get_user_email_from_db(user_id: int) -> str:
+    """DB에서 사용자 이메일 조회"""
+    db = SessionLocal()
+    try:
+        query = text("SELECT email FROM users WHERE user_id = :user_id")
+        result = db.execute(query, {"user_id": user_id}).fetchone()
+        if result:
+            return result[0]
+        return None
+    except Exception as e:
+        logger.error(f"사용자 이메일 조회 실패: {e}")
+        return None
+    finally:
+        db.close()
+
 # 오디오 피처 목록
 AUDIO_FEATURES = [
     'danceability', 'energy', 'speechiness', 'acousticness',
@@ -1466,7 +1485,14 @@ async def train_from_csv(
     6. 모델 저장
     """
     try:
-        model_path = USER_MODELS_DIR / f"user_{user_id}_svm.pkl"
+        # 사용자 이메일 조회
+        user_email = get_user_email_from_db(user_id)
+        if not user_email:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        email_prefix = user_email.split('@')[0]
+        model_path = USER_MODELS_DIR / f"{email_prefix}_.pkl"
+
         if model_path.exists() and not force_retrain:
             return TrainingResponse(
                 user_id=user_id,
@@ -1600,8 +1626,13 @@ async def retrain_with_feedback(
     4. 모델 재학습
     """
     try:
-        model_path = USER_MODELS_DIR / f"user_{user_id}_svm.pkl"
-        feedback_path = USER_MODELS_DIR / f"user_{user_id}_feedback.pkl"
+        user_email = get_user_email_from_db(user_id)
+        if not user_email:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        email_prefix = user_email.split('@')[0]
+        model_path = USER_MODELS_DIR / f"{email_prefix}_.pkl"
+        feedback_path = USER_MODELS_DIR / f"{email_prefix}_feedback.pkl"
 
         if not model_path.exists():
             raise HTTPException(

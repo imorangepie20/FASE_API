@@ -36,6 +36,8 @@ BASE_DIR = os.path.dirname(CURRENT_DIR)
 
 MODEL_DIR = os.path.join(BASE_DIR, 'model')
 DATASET_PATH = os.path.join(BASE_DIR, 'dataset', 'dataset.csv')
+USER_MODELS_DIR = os.path.join(BASE_DIR, 'user_models')
+os.makedirs(USER_MODELS_DIR, exist_ok=True)
 
 # 전역 변수 초기화
 model = CatBoostRegressor()
@@ -46,17 +48,47 @@ target_columns = ['danceability', 'energy', 'key', 'loudness', 'mode', 'speechin
 # --- [3. Internal Functions] ---
 
 def get_latest_model_path(user_id):
-    search_pattern = os.path.join(MODEL_DIR, f"recommender_U{user_id}_*.cbm")
-    model_files = glob.glob(search_pattern)
-    if not model_files:
+    """사용자별 모델 경로 반환 (이메일 기반)"""
+    from app.database import SessionLocal
+    from sqlalchemy import text
+
+    db = SessionLocal()
+    try:
+        query = text("SELECT email FROM users WHERE user_id = :user_id")
+        result = db.execute(query, {"user_id": user_id}).fetchone()
+        if result:
+            email_prefix = result[0].split('@')[0]
+            model_path = os.path.join(USER_MODELS_DIR, f"{email_prefix}_.cbm")
+            if os.path.exists(model_path):
+                return model_path
         return None
-    latest_model = max(model_files, key=os.path.getmtime)
-    return latest_model
+    except Exception as e:
+        print(f"사용자 모델 경로 조회 실패: {e}")
+        return None
+    finally:
+        db.close()
+
 
 def generate_new_model_path(user_id, playlist_title=""):
-    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_title = "".join(x for x in playlist_title if x.isalnum())[:10]
-    return os.path.join(MODEL_DIR, f"recommender_U{user_id}_{safe_title}_{date_str}.cbm")
+    """사용자 모델 경로 생성 (이메일 기반)"""
+    from app.database import SessionLocal
+    from sqlalchemy import text
+
+    db = SessionLocal()
+    try:
+        query = text("SELECT email FROM users WHERE user_id = :user_id")
+        result = db.execute(query, {"user_id": user_id}).fetchone()
+        if result:
+            email_prefix = result[0].split('@')[0]
+            model_path = os.path.join(USER_MODELS_DIR, f"{email_prefix}_.cbm")
+            os.makedirs(USER_MODELS_DIR, exist_ok=True)
+            return model_path
+        return None
+    except Exception as e:
+        print(f"사용자 모델 경로 생성 실패: {e}")
+        return None
+    finally:
+        db.close()
 
 def train_user_model(user_id, playlist_title, temp_df):
     global model

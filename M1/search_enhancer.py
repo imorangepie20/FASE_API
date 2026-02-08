@@ -194,17 +194,24 @@ class IntegratedRecommender:
                              weights: Dict[str, float] = None) -> pd.DataFrame:
         """
         Generate recommendations with search enhancement
+        
+        점수 계산 방식 (v2 - 더 엄격한 평가):
+        - audio_score: 사용자 프로필과의 유사도 (0~1, 절대적 코사인 유사도)
+        - qualitative_score: 장르 기반 품질 점수 (0~1)
+        - genre_score: 장르 일치도 (0~1, 정확한 매칭 필요)
+        - artist_score: 아티스트 친숙도 (0 또는 1)
+        - preference_score: 학습된 선호도 분류기 점수 (0~1)
         """
         if weights is None:
             weights = {
-                'predicted_audio': 0.35,
-                'qualitative': 0.25,
-                'genre': 0.15,
-                'artist': 0.1,
-                'preference': 0.15 if self.preference_classifier and self.preference_classifier.is_trained else 0.0
+                'predicted_audio': 0.40,  # 오디오 특성 유사도 (핵심)
+                'qualitative': 0.15,       # 품질 점수 (보조)
+                'genre': 0.25,             # 장르 일치도 (중요)
+                'artist': 0.10,            # 아티스트 친숙도 (보너스)
+                'preference': 0.10 if self.preference_classifier and self.preference_classifier.is_trained else 0.0
             }
         
-        print("\n INTEGRATED RECOMMENDATION PIPELINE")
+        print("\n INTEGRATED RECOMMENDATION PIPELINE (v2 - Strict Scoring)")
         print("=" * 60)
         
         # Step 1: Predict audio features
@@ -216,41 +223,94 @@ class IntegratedRecommender:
         enhanced = self.search_enhancer.enhance_track_batch(with_predictions)
         
         # Step 3: Calculate scores
-        print("\n3  Calculating recommendation scores...")
+        print("\n3  Calculating recommendation scores (strict mode)...")
         
-        # Predicted audio similarity
+        # ========== Audio Score (코사인 유사도 기반, 정규화 없이 절대값 사용) ==========
         pred_audio_features = [col for col in enhanced.columns if col.startswith('predicted_')]
         if pred_audio_features:
             user_pref_audio = np.array([
                 self.user_profile.feature_stats.get(feat, {}).get('mean', 0.5)
                 for feat in pred_audio_features
             ])
+            user_pref_std = np.array([
+                self.user_profile.feature_stats.get(feat, {}).get('std', 0.2)
+                for feat in pred_audio_features
+            ])
+            
             test_audio = enhanced[pred_audio_features].fillna(0.5).values
-            from sklearn.metrics.pairwise import cosine_similarity
-            audio_scores = cosine_similarity(test_audio, user_pref_audio.reshape(1, -1)).flatten()
+            
+            # 유클리드 거리 기반 유사도 (차이가 작을수록 높은 점수)
+            # 각 특성별 차이를 표준편차로 정규화하여 계산
+            audio_scores = []
+            for i in range(len(test_audio)):
+                track_features = test_audio[i]
+                # 각 특성별 z-score 차이 계산
+                z_diffs = np.abs(track_features - user_pref_audio) / (user_pref_std + 0.1)
+                # 평균 z-score 차이를 점수로 변환 (차이가 클수록 점수 낮음)
+                avg_z_diff = np.mean(z_diffs)
+                # z-score 2 이상이면 0점, 0이면 1점
+                score = max(0, 1 - (avg_z_diff / 2))
+                audio_scores.append(score)
+            audio_scores = np.array(audio_scores)
         else:
-            audio_scores = np.zeros(len(enhanced))
+            audio_scores = np.ones(len(enhanced)) * 0.5
         
-        # Qualitative similarity (from context and genre inferences)
-        qual_features = [col for col in enhanced.columns if col.startswith('context_') or col.startswith('genre_')]
-        if qual_features:
-            qual_scores = enhanced[qual_features].mean(axis=1).values
+        # ========== Qualitative Score (장르 프로필 기반) ==========
+        qual_features = [col for col in enhanced.columns if col.startswith('genre_')]
+        if qual_features and len(qual_features) > 0:
+            # 장르 기반 특성과 사용자 선호 특성 비교
+            qual_scores = []
+            for idx, row in enhanced.iterrows():
+                qual_score = 0.5  # 기본값
+                matches = 0
+                for feat in qual_features:
+                    feat_name = feat.replace('genre_', 'predicted_')
+                    if feat_name in self.user_profile.feature_stats:
+                        user_val = self.user_profile.feature_stats[feat_name].get('mean', 0.5)
+                        genre_val = row.get(feat, 0.5)
+                        # 차이가 0.2 이내면 일치로 판단
+                        if abs(genre_val - user_val) < 0.25:
+                            qual_score += 0.1
+                            matches += 1
+                qual_scores.append(min(qual_score, 1.0))
+            qual_scores = np.array(qual_scores)
         else:
             qual_scores = np.ones(len(enhanced)) * 0.5
         
-        # Genre similarity
+        # ========== Genre Score (정확한 장르 매칭) ==========
         if 'track_genre' in enhanced.columns:
             genre_scores = []
             for genre in enhanced['track_genre'].fillna('unknown'):
-                genre_list = str(genre).split(',')
-                score = sum(self.user_profile.genre_distribution.get(g.strip(), 0) for g in genre_list)
-                genre_scores.append(score)
+                genre_list = [g.strip().lower() for g in str(genre).split(',')]
+                
+                # unknown 장르는 중립 점수 0.3 (약간 페널티)
+                if genre_list == ['unknown'] or genre_list == ['']:
+                    genre_scores.append(0.3)
+                    continue
+                
+                # 사용자 장르 분포에서 해당 장르의 비율 합산
+                score = 0
+                matched = False
+                for g in genre_list:
+                    if g in ['unknown', '']:
+                        continue
+                    # 완전 일치만 카운트 (부분 일치 X)
+                    for user_genre, user_score in self.user_profile.genre_distribution.items():
+                        if g == user_genre.lower() and g != 'unknown':
+                            score += user_score
+                            matched = True
+                
+                # 매칭된 장르가 없으면 0.2
+                if not matched:
+                    genre_scores.append(0.2)
+                else:
+                    # 최대 1점으로 제한
+                    genre_scores.append(min(score, 1.0))
             genre_scores = np.array(genre_scores)
-            genre_scores = genre_scores / (genre_scores.max() + 1e-8)
         else:
             genre_scores = np.zeros(len(enhanced))
         
-        # Artist familiarity
+        # ========== Artist Score (아티스트 친숙도 - 보너스) ==========
         if 'artists' in enhanced.columns:
             artist_scores = enhanced['artists'].apply(
                 lambda x: 1.0 if str(x) in self.user_profile.artist_list else 0.0
@@ -258,38 +318,53 @@ class IntegratedRecommender:
         else:
             artist_scores = np.zeros(len(enhanced))
         
-        # Preference Classifier score
+        # ========== Preference Classifier Score ==========
         if self.preference_classifier and self.preference_classifier.is_trained:
             classifier_scores = self.preference_classifier.predict_score(enhanced, pred_audio_features)
         else:
             classifier_scores = np.zeros(len(enhanced))
-            
-        # Normalize audio scores
-        if audio_scores.max() > audio_scores.min():
-            audio_scores = (audio_scores - audio_scores.min()) / (audio_scores.max() - audio_scores.min())
         
-        # Combined score
+        # ========== Final Score 계산 (가중 합계, 정규화 없음) ==========
+        # preference가 없으면 다른 가중치 재분배
+        total_weight = sum(weights.values())
+        
         final_score = (
-            weights['predicted_audio'] * audio_scores +
-            weights['qualitative'] * qual_scores +
-            weights['genre'] * genre_scores +
-            weights['artist'] * artist_scores +
-            weights.get('preference', 0.0) * classifier_scores
+            (weights['predicted_audio'] / total_weight) * audio_scores +
+            (weights['qualitative'] / total_weight) * qual_scores +
+            (weights['genre'] / total_weight) * genre_scores +
+            (weights['artist'] / total_weight) * artist_scores +
+            (weights.get('preference', 0.0) / total_weight) * classifier_scores
         )
         
+        # NaN/Inf 값 처리
+        audio_scores = np.nan_to_num(audio_scores, nan=0.5, posinf=1.0, neginf=0.0)
+        qual_scores = np.nan_to_num(qual_scores, nan=0.5, posinf=1.0, neginf=0.0)
+        genre_scores = np.nan_to_num(genre_scores, nan=0.0, posinf=1.0, neginf=0.0)
+        artist_scores = np.nan_to_num(artist_scores, nan=0.0, posinf=1.0, neginf=0.0)
+        classifier_scores = np.nan_to_num(classifier_scores, nan=0.0, posinf=1.0, neginf=0.0)
+        final_score = np.nan_to_num(final_score, nan=0.0, posinf=1.0, neginf=0.0)
+        
         # Add to dataframe
-        enhanced['audio_score'] = audio_scores
-        enhanced['qualitative_score'] = qual_scores
-        enhanced['genre_score'] = genre_scores
-        enhanced['artist_score'] = artist_scores
-        enhanced['preference_score'] = classifier_scores
-        enhanced['final_score'] = final_score
+        enhanced['audio_score'] = np.round(audio_scores, 4)
+        enhanced['qualitative_score'] = np.round(qual_scores, 4)
+        enhanced['genre_score'] = np.round(genre_scores, 4)
+        enhanced['artist_score'] = np.round(artist_scores, 4)
+        enhanced['preference_score'] = np.round(classifier_scores, 4)
+        enhanced['final_score'] = np.round(final_score, 4)
         enhanced['rank'] = enhanced['final_score'].rank(ascending=False, method='first').astype(int)
         
         # Sort
         result = enhanced.sort_values('final_score', ascending=False).reset_index(drop=True)
         
+        # 통계 출력
         print("\n Recommendation completed!")
+        print(f"    Total tracks evaluated: {len(result)}")
         print(f"    Score range: {final_score.min():.3f} - {final_score.max():.3f}")
+        print(f"    Score distribution:")
+        print(f"      - 0.8+ (Excellent): {(final_score >= 0.8).sum()} tracks")
+        print(f"      - 0.7-0.8 (Good): {((final_score >= 0.7) & (final_score < 0.8)).sum()} tracks")
+        print(f"      - 0.6-0.7 (Fair): {((final_score >= 0.6) & (final_score < 0.7)).sum()} tracks")
+        print(f"      - 0.5-0.6 (Low): {((final_score >= 0.5) & (final_score < 0.6)).sum()} tracks")
+        print(f"      - <0.5 (Poor): {(final_score < 0.5).sum()} tracks")
         
         return result

@@ -13,11 +13,11 @@ services:
       - ENVIRONMENT=development
       - PORT=8000
       - EMS_API_URL=http://host.docker.internal:3001/api/ems
-      - DB_HOST=host.docker.internal
+      - DB_HOST=musicspace-db
       - DB_PORT=3306
-      - DB_NAME=music_space
-      - DB_USER=musicadmin
-      - DB_PASSWORD=${DB_PASSWORD:-your_password}
+      - DB_NAME=music_space_db
+      - DB_USER=root
+      - DB_PASSWORD=musicspace123
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
     volumes:
@@ -42,4 +42,5 @@ services:
 
 networks:
   music-network:
-    driver: bridge
+    external: true
+    name: humamappleteampreject001_musicspace-network

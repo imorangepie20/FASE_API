@@ -42,6 +42,30 @@ class RetrainRequest(BaseModel):
     user_id: int
     deleted_track_ids: List[int]
 
+class TransferEMSRequest(BaseModel):
+    userid: int
+    track_ids: Optional[List[int]] = None
+
+class TransferEMSResponse(BaseModel):
+    message: str
+    user_id: int
+    track_count: int
+    ems_tracks: List[Dict[str, Any]]
+    recommendations: List[Dict[str, Any]]
+    gms_playlist_id: Optional[int] = None
+
+
+class RandomEMSRequest(BaseModel):
+    userid: int
+    limit: Optional[int] = 100
+
+
+class RandomEMSResponse(BaseModel):
+    message: str
+    user_id: int
+    track_count: int
+    tracks: List[Dict[str, Any]]
+
 
 # ==================== API Endpoints ====================
 
@@ -59,31 +83,68 @@ async def health_check():
 @router.post("/analyze")
 async def analyze_user(request: AnalyzeRequest, db: Session = Depends(get_db)):
     """
-    사용자 분석 및 추천 생성 (Spring Boot TestController 연동)
+    사용자 분석 및 모델 학습 (1-4단계)
     
-    - PMS 데이터에서 사용자 프로필 생성
-    - EMS 데이터에서 후보 트랙 추출
-    - AI 점수 계산 후 GMS 플레이리스트 저장
+    1. 사용자 정보 검색 → 이메일 폴더 생성
+    2. 기본 모델을 사용자 폴더로 복사
+    3. PMS 트랙 가져오기
+    4. 모델 추가학습 → 파일명에 _ 붙임
     """
     try:
         user_id = request.userid
         
-        # 추천 생성
-        results = m1_service.get_recommendations(db, user_id)
+        # 1단계: 사용자 정보 조회
+        user_info = m1_service.get_user_info(db, user_id)
+        if not user_info:
+            return {
+                "success": False,
+                "message": f"사용자 {user_id}를 찾을 수 없습니다.",
+                "step": 1
+            }
         
-        if results.empty:
-            return {"message": f"사용자 {user_id}의 PMS 데이터가 없습니다."}
+        email = user_info['email']
+        email_prefix = m1_service.get_email_prefix(email)
+        print(f"[M1] 1단계: 사용자 정보 조회 완료 - {email}")
         
-        # GMS 플레이리스트 저장
-        playlist_id = m1_service.save_gms_playlist(db, user_id, results)
+        # 2단계: 사용자 폴더 생성 + 모델 복사
+        user_model_path = m1_service.copy_base_model_to_user(email)
+        if not user_model_path:
+            return {
+                "success": False,
+                "message": "기본 모델 파일이 없습니다.",
+                "step": 2
+            }
+        print(f"[M1] 2단계: 모델 복사 완료 - {user_model_path}")
+        
+        # 3-4단계: PMS 트랙으로 모델 추가학습
+        train_result = m1_service.train_user_model(db, user_id, email)
+        
+        if not train_result['success']:
+            return {
+                "success": False,
+                "message": train_result['message'],
+                "step": 3
+            }
+        
+        print(f"[M1] 3-4단계: 모델 학습 완료 - {train_result['track_count']}곡")
         
         return {
-            "message": f"사용자 {user_id}의 추천이 완료되었습니다. GMS 플레이리스트(ID: {playlist_id})에 {len(results)}곡 저장.",
-            "playlist_id": playlist_id,
-            "track_count": len(results)
+            "success": True,
+            "message": f"사용자 {email_prefix} 모델 학습 완료",
+            "user_id": user_id,
+            "email": email,
+            "email_prefix": email_prefix,
+            "track_count": train_result['track_count'],
+            "model_path": train_result['model_path']
         }
+        
     except Exception as e:
-        return {"message": f"오류 발생: {str(e)}"}
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"오류 발생: {str(e)}"
+        }
 
 
 @router.post("/recommend/{user_id}", response_model=RecommendResponse)
@@ -204,4 +265,131 @@ async def get_user_profile(user_id: int, db: Session = Depends(get_db)):
             "profile": profile
         }
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/random-ems", response_model=RandomEMSResponse)
+async def get_random_ems_tracks(request: RandomEMSRequest, db: Session = Depends(get_db)):
+    """
+    EMS 전체에서 랜덤 트랙 추출 (5-1단계용)
+    
+    - DB에서 직접 SQL RAND()로 균등 분포 랜덤 추출
+    - 중복 제거 (track_id 기준 DISTINCT)
+    - 아티스트별 편중 없이 다양한 트랙 반환
+    """
+    try:
+        user_id = request.userid
+        limit = request.limit or 100
+        
+        # DB에서 직접 랜덤 100곡 추출
+        random_tracks_df = m1_service.get_random_ems_tracks(db, limit)
+        
+        if random_tracks_df.empty:
+            return RandomEMSResponse(
+                message="EMS에 트랙이 없습니다.",
+                user_id=user_id,
+                track_count=0,
+                tracks=[]
+            )
+        
+        tracks_list = random_tracks_df.to_dict(orient='records')
+        
+        return RandomEMSResponse(
+            message=f"EMS에서 랜덤 {len(tracks_list)}곡 추출 완료",
+            user_id=user_id,
+            track_count=len(tracks_list),
+            tracks=tracks_list
+        )
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/transfer-ems", response_model=TransferEMSResponse)
+async def transfer_ems_tracks(request: TransferEMSRequest, db: Session = Depends(get_db)):
+    """
+    EMS 트랙 전달 및 추천 생성 (5-8단계)
+    
+    5. 전달받은 track_ids로 EMS 트랙 조회
+    6. 사용자 추가학습 모델(email_.pkl)로 평가
+    7. 평가 결과 반환
+    8. 결과 박스에 출력
+    """
+    try:
+        user_id = request.userid
+        track_ids = request.track_ids
+        
+        # 사용자 정보 조회 (추가학습 모델 경로 확인용)
+        user_info = m1_service.get_user_info(db, user_id)
+        if not user_info:
+            return TransferEMSResponse(
+                message=f"사용자 {user_id}를 찾을 수 없습니다.",
+                user_id=user_id,
+                track_count=0,
+                ems_tracks=[],
+                recommendations=[]
+            )
+        
+        email = user_info['email']
+        
+        # 5단계: EMS 트랙 조회
+        if track_ids and len(track_ids) > 0:
+            ems_tracks_df = m1_service.get_tracks_by_ids(db, track_ids)
+        else:
+            ems_tracks_df = m1_service.get_ems_tracks_from_db(db, user_id)
+        
+        if ems_tracks_df.empty:
+            return TransferEMSResponse(
+                message="EMS에 트랙이 없습니다.",
+                user_id=user_id,
+                track_count=0,
+                ems_tracks=[],
+                recommendations=[]
+            )
+        
+        ems_tracks_list = ems_tracks_df.to_dict(orient='records')
+        
+        # 6단계: 사용자 추가학습 모델로 평가
+        results = m1_service.evaluate_with_user_model(db, user_id, email, ems_tracks_df)
+        
+        if results.empty:
+            return TransferEMSResponse(
+                message=f"EMS 트랙 {len(ems_tracks_df)}곡 조회 완료. 추가학습 모델이 없어 평가 불가.",
+                user_id=user_id,
+                track_count=len(ems_tracks_df),
+                ems_tracks=ems_tracks_list,
+                recommendations=[]
+            )
+        
+        # 7단계: GMS 품질 필터링 (0.7 이상만 저장)
+        gms_pass = results[results['score'] >= 0.7].sort_values(
+            by='score', ascending=False
+        ).copy()
+        gms_pass['recommendation_score'] = gms_pass['score']
+
+        gms_playlist_id = None
+
+        # GMS 플레이리스트에 통과한 트랙이 있으면 생성
+        if not gms_pass.empty:
+            gms_playlist_id = m1_service.save_gms_playlist(db, user_id, gms_pass)
+
+        # 8단계: 결과 반환
+        top_recommendations = results.head(20).copy()
+        top_recommendations['score'] = top_recommendations['score']
+        recommendations_list = top_recommendations.to_dict(orient='records')
+
+        return TransferEMSResponse(
+            message=f"EMS 트랙 {len(ems_tracks_df)}곡 평가 완료. {len(results)}곡 추천됨. {len(gms_pass)}곡 GMS 통과.",
+            user_id=user_id,
+            track_count=len(ems_tracks_df),
+            ems_tracks=ems_tracks_list,
+            recommendations=recommendations_list,
+            gms_playlist_id=gms_playlist_id
+        )
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))

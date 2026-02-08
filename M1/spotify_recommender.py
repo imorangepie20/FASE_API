@@ -66,21 +66,26 @@ class AudioFeaturePredictor:
     def prepare_features(self, df: pd.DataFrame, fit: bool = False) -> np.ndarray:
         """
         Convert textual metadata to numerical features
+        NaN 값을 0으로 대체하여 모델 에러 방지
         """
         features_list = []
         
         # 1. Genre encoding (multi-hot)
         if 'track_genre' in df.columns:
-            genres = df['track_genre'].fillna('unknown').str.split(',').tolist()
+            genres = df['track_genre'].fillna('unknown').astype(str).str.split(',').tolist()
             if fit:
                 genre_features = self.genre_encoder.fit_transform(genres)
             else:
-                genre_features = self.genre_encoder.transform(genres)
+                try:
+                    genre_features = self.genre_encoder.transform(genres)
+                except ValueError:
+                    # Unknown genre handling
+                    genre_features = np.zeros((len(df), len(self.genre_encoder.classes_)))
             features_list.append(genre_features)
         
         # 2. Artist TF-IDF
         if 'artists' in df.columns:
-            artists = df['artists'].fillna('unknown')
+            artists = df['artists'].fillna('unknown').astype(str)
             if fit:
                 artist_features = self.artist_vectorizer.fit_transform(artists).toarray()
             else:
@@ -89,7 +94,7 @@ class AudioFeaturePredictor:
         
         # 3. Album TF-IDF
         if 'album_name' in df.columns:
-            albums = df['album_name'].fillna('unknown')
+            albums = df['album_name'].fillna('unknown').astype(str)
             if fit:
                 album_features = self.album_vectorizer.fit_transform(albums).toarray()
             else:
@@ -98,17 +103,22 @@ class AudioFeaturePredictor:
         
         # 4. Duration (normalized)
         if 'duration_ms' in df.columns:
-            duration = df['duration_ms'].fillna(df['duration_ms'].median()).values.reshape(-1, 1)
+            duration_median = df['duration_ms'].median() if not df['duration_ms'].isna().all() else 180000
+            duration = df['duration_ms'].fillna(duration_median).values.reshape(-1, 1)
             duration_normalized = duration / 300000  # normalize by 5 minutes
-            features_list.append(duration_normalized)
+            features_list.append(np.nan_to_num(duration_normalized, nan=0.0))
         
         # 5. Popularity (if available)
         if 'popularity' in df.columns:
             popularity = df['popularity'].fillna(50).values.reshape(-1, 1) / 100
-            features_list.append(popularity)
+            features_list.append(np.nan_to_num(popularity, nan=0.5))
         
         # Combine all features
         X = np.hstack(features_list)
+        
+        # 최종 NaN 방지
+        X = np.nan_to_num(X, nan=0.0, posinf=1.0, neginf=0.0)
+        
         return X
     
     def _create_model(self):
@@ -213,17 +223,29 @@ class AudioFeaturePredictor:
     def predict(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Predict audio features for tracks without them
+        NaN 값 안전 처리 포함
         """
+        if df.empty:
+            return df.copy()
+        
         X = self.prepare_features(df, fit=False)
+        
+        # NaN 방지 (스케일러 및 모델 에러 예방)
+        X = np.nan_to_num(X, nan=0.0, posinf=1.0, neginf=0.0)
 
         predictions = df.copy()
 
         for feature, model in self.models.items():
-            if feature in self.scalers:
-                X_input = self.scalers[feature].transform(X)
-            else:
-                X_input = X
-            predictions[f'predicted_{feature}'] = model.predict(X_input)
+            try:
+                if feature in self.scalers:
+                    X_input = self.scalers[feature].transform(X)
+                    X_input = np.nan_to_num(X_input, nan=0.0)
+                else:
+                    X_input = X
+                predictions[f'predicted_{feature}'] = model.predict(X_input)
+            except Exception as e:
+                print(f"[M1] Warning: Failed to predict {feature}: {e}")
+                predictions[f'predicted_{feature}'] = 0.5  # 기본값
 
         return predictions
     

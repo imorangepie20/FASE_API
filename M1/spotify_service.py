@@ -128,55 +128,68 @@ class SpotifyRecommendationService:
         
         return gms_pass
 
-    def save_gms_playlist(self, db: Session, user_id: int, recommendations_df: pd.DataFrame):
+def save_gms_playlist(self, db: Session, user_id: int, recommendations_df: pd.DataFrame):
         """Save recommendations as GMS playlist in DB"""
         from datetime import datetime
-        
-        # 1. Create GMS playlist
-        insert_playlist = text("""
-            INSERT INTO playlists (user_id, title, description, space_type, status_flag, source_type)
-            VALUES (:user_id, :title, :description, 'GMS', 'PFP', 'System')
-        """)
-        result = db.execute(insert_playlist, {
-            "user_id": user_id,
-            "title": f"Verified Gateway (GMS) - {datetime.now().strftime('%m/%d %H:%M')}",
-            "description": "AI 추천 플레이리스트"
-        })
-        playlist_id = result.lastrowid
-        
-        # 2. Insert tracks into playlist_tracks & track_scored_id
-        order_idx = 0
-        for _, row in recommendations_df.iterrows():
-            track_id = int(row['track_id'])
-            score = float(row['recommendation_score'])
-
-            # GMS Playlist link
-            db.execute(text("""
-                INSERT IGNORE INTO playlist_tracks (playlist_id, track_id, order_index)
-                VALUES (:playlist_id, :track_id, :order_index)
-            """), {"playlist_id": playlist_id, "track_id": track_id, "order_index": order_idx})
-            order_idx += 1
+        try:
+            # 0. 기존 GMS 플레이리스트 삭제 (중복 방지)
+            delete_old = text("""
+                DELETE FROM playlists 
+                WHERE user_id = :user_id AND space_type = 'GMS'
+            """)
+            db.execute(delete_old, {"user_id": user_id})
             
-            # Record final AI Score
-            db.execute(text("""
-                INSERT INTO track_scored_id (track_id, user_id, ai_score) 
-                VALUES (:track_id, :user_id, :score)
-                ON DUPLICATE KEY UPDATE ai_score = :score
-            """), {"track_id": track_id, "user_id": user_id, "score": score})
-        
-        db.commit()
-        return playlist_id
+            # 1. Create GMS playlist
+            insert_playlist = text("""
+                INSERT INTO playlists (user_id, title, description, space_type, status_flag, source_type)
+                VALUES (:user_id, :title, :description, 'GMS', 'PFP', 'System')
+            """)
+            result = db.execute(insert_playlist, {
+                "user_id": user_id,
+                "title": f"Verified Gateway (GMS) - {datetime.now().strftime('%m/%d %H:%M')}",
+                "description": "AI 추천 플레이리스트"
+            })
+            playlist_id = result.lastrowid
+            
+            # 2. Insert tracks into playlist_tracks & track_scored_id
+            order_idx = 0
+            for _, row in recommendations_df.iterrows():
+                track_id = int(row['track_id'])
+                score = float(row['recommendation_score'])
 
-    def delete_tracks_from_playlist(self, db: Session, playlist_id: int, track_ids: list):
+                # GMS Playlist link
+                db.execute(text("""
+                    INSERT IGNORE INTO playlist_tracks (playlist_id, track_id, order_index)
+                    VALUES (:playlist_id, :track_id, :order_index)
+                """), {"playlist_id": playlist_id, "track_id": track_id, "order_index": order_idx})
+                order_idx += 1
+                
+                # Record final AI Score
+                db.execute(text("""
+                    INSERT INTO track_scored_id (track_id, user_id, ai_score) 
+                    VALUES (:track_id, :user_id, :score)
+                    ON DUPLICATE KEY UPDATE ai_score = :score
+                """), {"track_id": track_id, "user_id": user_id, "score": score})
+            
+            db.commit()
+            return playlist_id
+        except Exception as e:
+            db.rollback()
+            print(f"[Spotify] GMS 저장 실패: {e}")
+            raise
+
+def delete_tracks_from_playlist(self, db: Session, playlist_id: int, track_ids: list):
         """Delete specific tracks from a playlist"""
-        delete_query = text("""
+        placeholders = ','.join([f':tid_{i}' for i in range(len(track_ids))])
+        params = {'playlist_id': playlist_id}
+        for i, tid in enumerate(track_ids):
+            params[f'tid_{i}'] = tid
+        
+        delete_query = text(f"""
             DELETE FROM playlist_tracks 
-            WHERE playlist_id = :playlist_id AND track_id IN :track_ids
+            WHERE playlist_id = :playlist_id AND track_id IN ({placeholders})
         """)
-        db.execute(delete_query, {
-            "playlist_id": playlist_id,
-            "track_ids": tuple(track_ids)
-        })
+        db.execute(delete_query, params)
         db.commit()
         return {"status": "success", "deleted_count": len(track_ids)}
 
