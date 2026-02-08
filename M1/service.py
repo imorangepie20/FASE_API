@@ -575,7 +575,9 @@ class M1RecommendationService:
         gms_pass = gms_pass.drop_duplicates(subset=['track_id'], keep='first')
         
         # 아티스트+제목 기준 중복 제거 (같은 곡이 다른 track_id로 존재할 수 있음)
-        gms_pass['artist_title_key'] = gms_pass['artist'].str.lower() + '|' + gms_pass['track_name'].str.lower()
+        # 컬럼명: artist 또는 artists (DB 조회 후 rename됨)
+        artist_col = 'artists' if 'artists' in gms_pass.columns else 'artist'
+        gms_pass['artist_title_key'] = gms_pass[artist_col].str.lower() + '|' + gms_pass['track_name'].str.lower()
         gms_pass = gms_pass.drop_duplicates(subset=['artist_title_key'], keep='first')
         gms_pass = gms_pass.drop(columns=['artist_title_key'])
         
@@ -594,12 +596,7 @@ class M1RecommendationService:
     def save_gms_playlist(self, db: Session, user_id: int, recommendations_df: pd.DataFrame) -> int:
         """추천 결과를 GMS 플레이리스트로 DB에 저장"""
         try:
-            # 0. 기존 GMS 플레이리스트 삭제 (중복 방지)
-            delete_old = text("""
-                DELETE FROM playlists 
-                WHERE user_id = :user_id AND space_type = 'GMS'
-            """)
-            db.execute(delete_old, {"user_id": user_id})
+            # 기존 GMS 플레이리스트는 유지 (사용자가 직접 승인/거절로 관리)
             
             # 1. GMS 플레이리스트 생성
             insert_playlist = text("""
