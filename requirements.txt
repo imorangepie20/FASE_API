@@ -7,6 +7,7 @@ pydantic-settings>=2.1.0
 # Data Processing
 pandas>=2.1.0
 numpy>=1.26.0
+pyarrow>=14.0.0
 
 # ML Libraries
 scikit-learn>=1.4.0
@@ -14,6 +15,10 @@ catboost>=1.2.0
 lightgbm>=4.3.0
 joblib>=1.3.0
 sentence-transformers>=2.2.0
+
+# L1 Kuka (Spotify Recommendation)
+faiss-cpu>=1.7.4
+google-genai>=0.1.0
 
 # HTTP Client
 httpx>=0.26.0

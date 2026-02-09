@@ -35,35 +35,35 @@ async def lifespan(app: FastAPI):
     """앱 시작/종료 시 실행"""
     # 시작 시
     print("=" * 60)
-    print("🚀 AI Music Analysis API 시작")
+    print("[START] AI Music Analysis API")
     print("=" * 60)
     
     # DB 연결 테스트
     try:
         from database import test_connection
         if test_connection():
-            print("✅ Database 연결 성공")
+            print("[OK] Database connected")
         else:
-            print("⚠️ Database 연결 실패 - API는 계속 실행됨")
+            print("[WARN] Database connection failed - API continues")
     except Exception as e:
-        print(f"⚠️ Database 모듈 로드 실패: {e}")
+        print(f"[WARN] Database module load failed: {e}")
     
     # M1 모델 상태
     try:
         model_path = os.path.join(os.path.dirname(__file__), "M1", "audio_predictor.pkl")
         if os.path.exists(model_path):
-            print(f"✅ M1 모델 파일 존재: {model_path}")
+            print(f"[OK] M1 model exists: {model_path}")
         else:
-            print(f"⚠️ M1 모델 파일 없음: {model_path}")
+            print(f"[WARN] M1 model not found: {model_path}")
     except Exception as e:
-        print(f"⚠️ M1 모델 확인 실패: {e}")
+        print(f"[WARN] M1 model check failed: {e}")
     
     print("=" * 60)
     
     yield  # 앱 실행
     
     # 종료 시
-    print("🛑 AI Music Analysis API 종료")
+    print("[STOP] AI Music Analysis API")
 
 
 # ==================== FastAPI 앱 초기화 ====================
@@ -109,9 +109,9 @@ app.add_middleware(
 try:
     from M1.router import router as m1_router
     app.include_router(m1_router)
-    print("✅ M1 Router 등록 완료")
+    print("[OK] M1 Router registered")
 except Exception as e:
-    print(f"⚠️ M1 Router 등록 실패: {e}")
+    print(f"[WARN] M1 Router failed: {e}")
 
 
 # ==================== M2 Router 등록 ====================
@@ -119,9 +119,9 @@ except Exception as e:
 try:
     from M2.router import router as m2_router
     app.include_router(m2_router)
-    print("✅ M2 Router 등록 완료")
+    print("[OK] M2 Router registered")
 except Exception as e:
-    print(f"⚠️ M2 Router 등록 실패: {e}")
+    print(f"[WARN] M2 Router failed: {e}")
 
 
 # ==================== M3 Router 등록 ====================
@@ -129,9 +129,9 @@ except Exception as e:
 try:
     from M3.router import router as m3_router
     app.include_router(m3_router)
-    print("✅ M3 Router 등록 완료")
+    print("[OK] M3 Router registered")
 except Exception as e:
-    print(f"⚠️ M3 Router 등록 실패: {e}")
+    print(f"[WARN] M3 Router failed: {e}")
 
 
 # ==================== User Model Initialization Router 등록 ====================
@@ -139,10 +139,29 @@ except Exception as e:
 try:
     from init_user_models import router as init_models_router
     app.include_router(init_models_router, prefix="/api")
-    print("✅ User Model Initialization Router 등록 완료")
+    print("[OK] User Model Initialization Router registered")
 except Exception as e:
-    print(f"⚠️ User Model Initialization Router 등록 실패: {e}")
+    print(f"[WARN] User Model Initialization Router failed: {e}")
 
+
+# ==================== L1 Kuka (Spotify Recommend) Router 등록 ====================
+
+try:
+    # L1 경로를 sys.path에 추가
+    l1_path = os.path.join(os.path.dirname(__file__), "LLM", "L1")
+    if l1_path not in sys.path:
+        sys.path.insert(0, l1_path)
+
+    from app.routers.Kuka.recommend import router as kuka_router
+    from app.services.Kuka.service import spotify_service
+
+    # 데이터 로딩 (서버 시작 시)
+    spotify_service.load()
+
+    app.include_router(kuka_router)
+    print("[OK] L1 Kuka Router registered (/api/spotify/recommend)")
+except Exception as e:
+    print(f"[WARN] L1 Kuka Router failed: {e}")
 
 
 # ==================== Pydantic Models (공통) ====================
