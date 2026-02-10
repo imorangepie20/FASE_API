@@ -1,0 +1,17 @@
+# Kuka Spotify 추천 시스템 의존성
+
+# FAISS 벡터 검색
+faiss-cpu>=1.7.4
+
+# 텍스트 임베딩 (MiniLM-L6-v2)
+sentence-transformers>=2.2.0
+
+# 데이터 처리
+pandas>=2.0.0
+numpy>=1.24.0
+
+# 머신러닝
+scikit-learn>=1.3.0
+
+# RAG 설명 생성 (선택)
+google-genai>=0.1.0

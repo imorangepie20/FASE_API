@@ -35,3 +35,7 @@ ENV/
 
 # Local settings
 *.local
+
+# Large model files (upload via FTP)
+LLM/L1/models/*.npy
+LLM/L1/*.zip
