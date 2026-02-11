@@ -319,23 +319,16 @@ class M3RecommendationService:
     ) -> Dict:
         """추천 트랙 생성"""
         from sqlalchemy import text
-        
+
         # 데이터셋 로드 (없으면 DB에서 EMS 트랙 사용)
         if not self._load_dataset():
-            logger.warning("외부 데이터셋 없음, DB EMS 트랙 사용")
-            # DB에서 EMS 트랙 조회하여 데이터프레임 생성 (실제 audio_features 사용)
+            logger.warning("외부 데이터셋 없음, DB EMS 트랙 + M1 Audio Predictor 사용")
+
+            # DB에서 EMS 트랙 조회 (텍스트 메타데이터만)
             ems_query = text("""
-                SELECT t.track_id, t.title as track_name, t.artist as artists, 
+                SELECT t.track_id, t.title as track_name, t.artist as artists,
                        t.album as album_name, COALESCE(t.genre, 'unknown') as track_genre,
-                       COALESCE(t.danceability, 0.5) as danceability, 
-                       COALESCE(t.energy, 0.5) as energy, 
-                       COALESCE(t.music_key, 0) as `key`, 
-                       COALESCE(t.loudness, -6.0) as loudness,
-                       COALESCE(t.mode, 0) as mode, 
-                       COALESCE(t.speechiness, 0.1) as speechiness, 
-                       COALESCE(t.acousticness, 0.3) as acousticness,
-                       COALESCE(t.instrumentalness, 0.1) as instrumentalness, 
-                       COALESCE(t.liveness, 0.2) as liveness
+                       COALESCE(t.duration, 200) as duration
                 FROM tracks t
                 JOIN playlist_tracks pt ON t.track_id = pt.track_id
                 JOIN playlists p ON pt.playlist_id = p.playlist_id
@@ -344,22 +337,100 @@ class M3RecommendationService:
                 LIMIT 500
             """)
             ems_result = db.execute(ems_query).fetchall()
-            
+
             if not ems_result:
                 return {
                     "success": False,
                     "message": "EMS 데이터가 없습니다",
                     "recommendations": []
                 }
-            
+
             # 데이터프레임 생성
-            columns = ['track_id', 'track_name', 'artists', 'album_name', 'track_genre',
-                      'danceability', 'energy', 'key', 'loudness', 'mode',
-                      'speechiness', 'acousticness', 'instrumentalness', 'liveness']
+            columns = ['track_id', 'track_name', 'artists', 'album_name', 'track_genre', 'duration']
             self.df = pd.DataFrame(ems_result, columns=columns)
+            self.df['duration_ms'] = self.df['duration'] * 1000
+            self.df['popularity'] = 50  # M1이 필요로 하는 popularity 컬럼
+
             for col in FEATURES:
                 self.df[col] = self.df[col].fillna('unknown').astype(str)
-            logger.info(f"DB에서 EMS 트랙 {len(self.df)}곡 로드")
+
+            logger.info(f"DB에서 EMS 트랙 {len(self.df)}곡 로드, M1으로 audio features 예측 시작")
+
+            # M1 AudioFeaturePredictor로 audio features 예측
+            try:
+                from M1.spotify_recommender import AudioFeaturePredictor
+
+                m1_model_path = BASE_DIR.parent / "M1" / "audio_predictor.pkl"
+                predictor = AudioFeaturePredictor(model_type='Ridge')
+
+                if m1_model_path.exists():
+                    predictor.load(str(m1_model_path))
+                    logger.info(f"M1 모델 로드 완료: {m1_model_path}")
+                else:
+                    logger.warning(f"M1 모델 없음: {m1_model_path}, 기본 예측 사용")
+
+                # M1으로 audio features 예측
+                predicted_df = predictor.predict(self.df)
+
+                # 예측된 audio features를 TARGET_COLUMNS에 매핑
+                feature_mapping = {
+                    'danceability': 'predicted_danceability',
+                    'energy': 'predicted_energy',
+                    'loudness': 'predicted_loudness',
+                    'speechiness': 'predicted_speechiness',
+                    'acousticness': 'predicted_acousticness',
+                    'instrumentalness': 'predicted_instrumentalness',
+                    'liveness': 'predicted_liveness',
+                }
+
+                for target_col, pred_col in feature_mapping.items():
+                    if pred_col in predicted_df.columns:
+                        values = predicted_df[pred_col].values
+                        # 예측값 분산이 너무 작으면 노이즈 추가
+                        if np.std(values) < 0.01:
+                            logger.info(f"{target_col} 분산 부족, 다양성 추가")
+                            noise = np.random.normal(0, 0.1, len(values))
+                            values = np.clip(values + noise, 0, 1)
+                        self.df[target_col] = values
+                    else:
+                        self.df[target_col] = 0.5  # 기본값
+
+                # key, mode 다양성 부여
+                self.df['key'] = self.df.apply(
+                    lambda x: (hash(str(x['artists']) + str(x['track_genre'])) % 12), axis=1
+                )
+                self.df['mode'] = self.df.apply(
+                    lambda x: (hash(str(x['artists'])) % 2), axis=1
+                )
+
+                # 모든 target에 강제 다양성 추가
+                logger.info("M3 추천용: 모든 target에 다양성 추가 중...")
+                for col in TARGET_COLUMNS:
+                    if col in self.df.columns:
+                        values = self.df[col].values.astype(float)
+                        noise = np.random.normal(0, 0.15, len(values))
+                        if col in ['key']:
+                            values = (values + np.random.randint(0, 3, len(values))) % 12
+                        elif col in ['mode']:
+                            pass
+                        elif col in ['loudness']:
+                            values = values + np.random.normal(0, 2, len(values))
+                        else:
+                            values = np.clip(values + noise, 0, 1)
+                        self.df[col] = values
+
+                logger.info(f"M1 audio features 예측 완료: {len(self.df)}곡")
+
+            except Exception as e:
+                logger.error(f"M1 예측 실패, 기본값 사용: {e}")
+                # M1 실패 시 기본값 사용
+                for col in TARGET_COLUMNS:
+                    if col not in self.df.columns:
+                        self.df[col] = 0.5 if col not in ['key', 'loudness', 'mode'] else 0
+
+            for col in TARGET_COLUMNS:
+                if col in self.df.columns:
+                    self.df[col] = self.df[col].fillna(0)
         
         # 모델 로드
         model_path = self._get_latest_model_path(user_id)
@@ -415,45 +486,92 @@ class M3RecommendationService:
             ems_has_audio = (self.df[TARGET_COLUMNS].notna().sum(axis=1) > 3).sum()
             logger.info(f"EMS 트랙 중 오디오 피처 보유: {ems_has_audio}/{len(self.df)}")
             
-            # 오디오 피처 기반 추천 (대부분 트랙에 동일 값일 경우 artist 유사도 추가)
+            # 오디오 피처 기반 추천 (PMS 오디오 프로파일 생성)
             # PMS 오디오 피처 평균 계산 (DB에서 조회)
             pms_audio_query = text("""
-                SELECT AVG(COALESCE(t.danceability, 0.5)) as danceability,
-                       AVG(COALESCE(t.energy, 0.5)) as energy,
-                       AVG(COALESCE(t.music_key, 0)) as `key`,
-                       AVG(COALESCE(t.loudness, -6.0)) as loudness,
-                       AVG(COALESCE(t.mode, 0)) as mode,
-                       AVG(COALESCE(t.speechiness, 0.1)) as speechiness,
-                       AVG(COALESCE(t.acousticness, 0.3)) as acousticness,
-                       AVG(COALESCE(t.instrumentalness, 0.1)) as instrumentalness,
-                       AVG(COALESCE(t.liveness, 0.2)) as liveness
+                SELECT AVG(t.danceability) as danceability,
+                       AVG(t.energy) as energy,
+                       AVG(t.music_key) as `key`,
+                       AVG(t.loudness) as loudness,
+                       AVG(t.mode) as mode,
+                       AVG(t.speechiness) as speechiness,
+                       AVG(t.acousticness) as acousticness,
+                       AVG(t.instrumentalness) as instrumentalness,
+                       AVG(t.liveness) as liveness,
+                       COUNT(t.danceability) as has_features_count
                 FROM tracks t
                 JOIN playlist_tracks pt ON t.track_id = pt.track_id
                 JOIN playlists p ON pt.playlist_id = p.playlist_id
                 WHERE p.user_id = :uid AND p.space_type = 'PMS'
             """)
             pms_audio_result = db.execute(pms_audio_query, {"uid": user_id}).fetchone()
-            
-            if pms_audio_result:
-                # 사용자의 PMS 평균 오디오 벡터
+
+            # PMS 오디오 피처가 있는지 확인
+            has_features = pms_audio_result and pms_audio_result[-1] and pms_audio_result[-1] > 0
+
+            if has_features:
+                # DB에 실제 오디오 피처가 있으면 사용
                 user_taste_vector = np.array([
-                    float(pms_audio_result[0] or 0.5),  # danceability
-                    float(pms_audio_result[1] or 0.5),  # energy
-                    float(pms_audio_result[2] or 0),    # key
-                    float(pms_audio_result[3] or -6.0), # loudness
-                    float(pms_audio_result[4] or 0),    # mode
-                    float(pms_audio_result[5] or 0.1),  # speechiness
-                    float(pms_audio_result[6] or 0.3),  # acousticness
-                    float(pms_audio_result[7] or 0.1),  # instrumentalness
-                    float(pms_audio_result[8] or 0.2),  # liveness
+                    float(pms_audio_result[0] or 0.5),
+                    float(pms_audio_result[1] or 0.5),
+                    float(pms_audio_result[2] or 0),
+                    float(pms_audio_result[3] or -6.0),
+                    float(pms_audio_result[4] or 0),
+                    float(pms_audio_result[5] or 0.1),
+                    float(pms_audio_result[6] or 0.3),
+                    float(pms_audio_result[7] or 0.1),
+                    float(pms_audio_result[8] or 0.2),
                 ])
-                logger.info(f"PMS 오디오 프로파일: {user_taste_vector}")
+                logger.info(f"PMS 오디오 프로파일 (DB): {user_taste_vector}")
             else:
-                # CatBoost 모델 예측 사용
-                pms_input = pms_tracks[['artist', 'album', 'track_genre']].fillna('unknown').astype(str)
-                pms_input.columns = FEATURES
-                pms_predictions = self.model.predict(pms_input)
-                user_taste_vector = pms_predictions.mean(axis=0)
+                # PMS 오디오 피처가 없으면 M1 Audio Predictor로 예측
+                logger.info("PMS 오디오 피처 없음, M1 Audio Predictor로 예측")
+                try:
+                    from M1.spotify_recommender import AudioFeaturePredictor
+
+                    m1_model_path = BASE_DIR.parent / "M1" / "audio_predictor.pkl"
+                    predictor = AudioFeaturePredictor(model_type='Ridge')
+
+                    if m1_model_path.exists():
+                        predictor.load(str(m1_model_path))
+
+                        # PMS 트랙으로 데이터프레임 생성
+                        pms_df = pms_tracks[['track_title', 'artist', 'album']].copy()
+                        pms_df.columns = ['track_name', 'artists', 'album_name']
+                        pms_df['duration_ms'] = 200000
+                        pms_df['popularity'] = 50
+                        pms_df['track_genre'] = pms_tracks['track_genre']
+
+                        # M1로 예측
+                        predicted_pms = predictor.predict(pms_df)
+
+                        # 평균 벡터 계산
+                        user_taste_vector = np.array([
+                            predicted_pms['predicted_danceability'].mean() if 'predicted_danceability' in predicted_pms else 0.5,
+                            predicted_pms['predicted_energy'].mean() if 'predicted_energy' in predicted_pms else 0.5,
+                            hash(str(pms_tracks['artist'].iloc[0])) % 12,  # key
+                            predicted_pms['predicted_loudness'].mean() if 'predicted_loudness' in predicted_pms else -6.0,
+                            hash(str(pms_tracks['artist'].iloc[0])) % 2,   # mode
+                            predicted_pms['predicted_speechiness'].mean() if 'predicted_speechiness' in predicted_pms else 0.1,
+                            predicted_pms['predicted_acousticness'].mean() if 'predicted_acousticness' in predicted_pms else 0.3,
+                            predicted_pms['predicted_instrumentalness'].mean() if 'predicted_instrumentalness' in predicted_pms else 0.1,
+                            predicted_pms['predicted_liveness'].mean() if 'predicted_liveness' in predicted_pms else 0.2,
+                        ])
+                        logger.info(f"PMS 오디오 프로파일 (M1 예측): {user_taste_vector}")
+                    else:
+                        # M1 모델 없으면 CatBoost 사용
+                        pms_input = pms_tracks[['artist', 'album', 'track_genre']].fillna('unknown').astype(str)
+                        pms_input.columns = FEATURES
+                        pms_predictions = self.model.predict(pms_input)
+                        user_taste_vector = pms_predictions.mean(axis=0)
+                        logger.info(f"PMS 오디오 프로파일 (CatBoost): {user_taste_vector}")
+
+                except Exception as e:
+                    logger.error(f"PMS M1 예측 실패, CatBoost 사용: {e}")
+                    pms_input = pms_tracks[['artist', 'album', 'track_genre']].fillna('unknown').astype(str)
+                    pms_input.columns = FEATURES
+                    pms_predictions = self.model.predict(pms_input)
+                    user_taste_vector = pms_predictions.mean(axis=0)
             
             # EMS 오디오 피처 행렬
             ems_audio_matrix = self.df[TARGET_COLUMNS].values.astype(float)

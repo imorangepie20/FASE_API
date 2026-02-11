@@ -249,18 +249,17 @@ async def train_model(user_id: int, playlist_id: Optional[int] = None):
                     "user_id": user_id
                 }
             
-            # EMS에서 Negative 트랙 샘플링 (3배)
+            # EMS에서 Negative 트랙 샘플링 (3배, EMS는 공용)
             ems_query = text("""
                 SELECT t.title, t.artist, t.album, t.duration
                 FROM tracks t
                 JOIN playlist_tracks pt ON t.track_id = pt.track_id
                 JOIN playlists p ON pt.playlist_id = p.playlist_id
-                WHERE p.user_id = :user_id AND p.space_type = 'EMS'
+                WHERE p.space_type = 'EMS'
                 ORDER BY RAND()
                 LIMIT :limit
             """)
             ems_result = db.execute(ems_query, {
-                "user_id": user_id, 
                 "limit": len(positive_tracks) * 3
             }).fetchall()
             

@@ -246,12 +246,13 @@ class EmbeddingService:
 
 class M2RecommendationService:
     """M2 SVM 기반 추천 서비스"""
-    
+
     def __init__(self):
         self.embedding_service = EmbeddingService()
         self.audio_service = AudioPredictionService()
         self.user_models: Dict[int, Any] = {}  # user_id -> SVM model
-        self.models_dir = BASE_DIR / 'user_svm_models'
+        self.user_tfidf_models: Dict[int, TfidfVectorizer] = {}  # user_id -> TfidfVectorizer
+        self.models_dir = BASE_DIR / 'user_models'
         self.models_dir.mkdir(parents=True, exist_ok=True)
         self._feature_dim = None  # 동적으로 설정
     
@@ -262,11 +263,31 @@ class M2RecommendationService:
         album_name: str = "",
         tags: str = "",
         audio_features: Optional[Dict[str, float]] = None,
-        duration_ms: int = 200000
+        duration_ms: int = 200000,
+        user_id: Optional[int] = None,
+        tfidf_vectorizer: Optional[TfidfVectorizer] = None
     ) -> np.ndarray:
         """피처 벡터 생성 (임베딩 + 9D 오디오)"""
-        # 1. 텍스트 임베딩 (384D or 500D depending on model)
-        embedding = self.embedding_service.encode_track(artist, track_name, album_name, tags)
+        # 1. 텍스트 임베딩
+        if tfidf_vectorizer is not None:
+            # 저장된 TF-IDF 사용 (transform만, fit 안 함)
+            text = f"{artist} {track_name}"
+            if album_name:
+                text += f" {album_name}"
+            if tags:
+                text += f" {tags.replace('|', ' ')}"
+            embedding = tfidf_vectorizer.transform([text]).toarray()[0]
+        elif user_id is not None and user_id in self.user_tfidf_models:
+            # 사용자별 저장된 TF-IDF 사용
+            text = f"{artist} {track_name}"
+            if album_name:
+                text += f" {album_name}"
+            if tags:
+                text += f" {tags.replace('|', ' ')}"
+            embedding = self.user_tfidf_models[user_id].transform([text]).toarray()[0]
+        else:
+            # 기존 방식 (EmbeddingService 사용)
+            embedding = self.embedding_service.encode_track(artist, track_name, album_name, tags)
         
         # 2. 오디오 피처 (9D)
         if audio_features is None:
@@ -304,14 +325,15 @@ class M2RecommendationService:
         """단일 트랙 SVM 예측"""
         # 사용자 모델 로드
         model = self._load_user_model(user_id)
-        
-        # 피처 생성
+
+        # 피처 생성 (user_id 전달하여 저장된 TF-IDF 사용)
         features = self._create_features(
             artist=artist,
             track_name=track_name,
             album_name=album_name,
             tags=tags,
-            duration_ms=duration_ms
+            duration_ms=duration_ms,
+            user_id=user_id
         )
         
         X = features.reshape(1, -1)
@@ -379,20 +401,31 @@ class M2RecommendationService:
         return sorted_results[:top_k]
     
     def _load_user_model(self, user_id: int) -> Optional[Any]:
-        """사용자 SVM 모델 로드"""
+        """사용자 SVM 모델 및 TF-IDF 로드"""
         if user_id in self.user_models:
             return self.user_models[user_id]
-        
+
         model_path = self.models_dir / f"user_{user_id}_svm.pkl"
-        
+        tfidf_path = self.models_dir / f"user_{user_id}_tfidf.pkl"
+
         if not model_path.exists():
             logger.info(f"사용자 {user_id} SVM 모델 없음")
             return None
-        
+
         try:
+            # SVM 모델 로드
             model = joblib.load(model_path)
             self.user_models[user_id] = model
             logger.info(f"사용자 {user_id} SVM 모델 로드 완료")
+
+            # TF-IDF 로드 (있으면)
+            if tfidf_path.exists():
+                tfidf = joblib.load(tfidf_path)
+                self.user_tfidf_models[user_id] = tfidf
+                logger.info(f"사용자 {user_id} TF-IDF 로드 완료")
+            else:
+                logger.warning(f"사용자 {user_id} TF-IDF 파일 없음 (기존 모델일 수 있음)")
+
             return model
         except Exception as e:
             logger.error(f"사용자 {user_id} SVM 모델 로드 실패: {e}")
@@ -412,35 +445,60 @@ class M2RecommendationService:
             }
         
         try:
-            # 피처 생성
+            # 1. 모든 트랙으로 TF-IDF fit
+            all_tracks = positive_tracks + negative_tracks
+            texts = []
+            for track in all_tracks:
+                text = f"{track.get('artist', '')} {track.get('track_name', '')}"
+                if track.get('album_name'):
+                    text += f" {track.get('album_name')}"
+                if track.get('tags'):
+                    text += f" {track.get('tags', '').replace('|', ' ')}"
+                texts.append(text)
+
+            # TF-IDF 학습
+            tfidf = TfidfVectorizer(max_features=500, ngram_range=(1, 2))
+            tfidf.fit(texts)
+            logger.info(f"TF-IDF vocabulary 크기: {len(tfidf.vocabulary_)}, 학습 텍스트 수: {len(texts)}")
+
+            # 2. 학습한 TF-IDF로 피처 생성
             X_list = []
             y_list = []
-            
+
             for track in positive_tracks:
                 features = self._create_features(
                     artist=track.get('artist', ''),
                     track_name=track.get('track_name', ''),
                     album_name=track.get('album_name', ''),
                     tags=track.get('tags', ''),
-                    duration_ms=track.get('duration_ms', 200000)
+                    duration_ms=track.get('duration_ms', 200000),
+                    tfidf_vectorizer=tfidf
                 )
                 X_list.append(features)
                 y_list.append(1)
-            
+
             for track in negative_tracks:
                 features = self._create_features(
                     artist=track.get('artist', ''),
                     track_name=track.get('track_name', ''),
                     album_name=track.get('album_name', ''),
                     tags=track.get('tags', ''),
-                    duration_ms=track.get('duration_ms', 200000)
+                    duration_ms=track.get('duration_ms', 200000),
+                    tfidf_vectorizer=tfidf
                 )
                 X_list.append(features)
                 y_list.append(0)
             
+            # 피처 크기 검증
+            feature_sizes = [len(f) if not hasattr(f, 'shape') else f.shape[0] for f in X_list]
+            unique_sizes = set(feature_sizes)
+            logger.info(f"피처 크기 분포: {unique_sizes}, 총 {len(X_list)}개")
+            if len(unique_sizes) > 1:
+                logger.error(f"피처 크기 불일치! 크기별 개수: {[(size, feature_sizes.count(size)) for size in unique_sizes]}")
+
             X = np.array(X_list)
             y = np.array(y_list)
-            
+
             # SVM 학습
             pipeline = Pipeline([
                 ('scaler', StandardScaler()),
@@ -452,11 +510,17 @@ class M2RecommendationService:
             # 모델 저장
             model_path = self.models_dir / f"user_{user_id}_svm.pkl"
             joblib.dump(pipeline, model_path)
-            
+
+            # TF-IDF 저장
+            tfidf_path = self.models_dir / f"user_{user_id}_tfidf.pkl"
+            joblib.dump(tfidf, tfidf_path)
+
             # 캐시 업데이트
             self.user_models[user_id] = pipeline
-            
+            self.user_tfidf_models[user_id] = tfidf
+
             logger.info(f"사용자 {user_id} SVM 모델 학습 완료: {model_path}")
+            logger.info(f"사용자 {user_id} TF-IDF 저장 완료: {tfidf_path}")
             
             return {
                 "success": True,

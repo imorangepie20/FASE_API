@@ -84,15 +84,15 @@ class SpotifyRecommendationService:
         user_profile = UserPreferenceProfile()
         user_profile.build_profile(pms_enhanced)
         
-        # 2. Get EMS Candidate Tracks
+        # 2. Get EMS Candidate Tracks (EMS는 공용)
         query = text("""
             SELECT t.track_id, t.title, t.artist, t.album, t.duration, t.external_metadata
             FROM tracks t
             JOIN playlist_tracks pt ON t.track_id = pt.track_id
             JOIN playlists p ON pt.playlist_id = p.playlist_id
-            WHERE p.user_id = :user_id AND p.space_type = 'EMS'
+            WHERE p.space_type = 'EMS'
         """)
-        result = db.execute(query, {"user_id": user_id})
+        result = db.execute(query)
         ems_df = pd.DataFrame(result.fetchall(), columns=['track_id', 'title', 'artist', 'album', 'duration', 'external_metadata'])
 
         # 컬럼명 변환

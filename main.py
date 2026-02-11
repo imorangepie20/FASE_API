@@ -463,21 +463,21 @@ async def unified_recommend(request: UnifiedRecommendRequest):
         elif model == "M2":
             # M2: SVM + Text Embedding
             from M2.service import get_m2_service
-            
+
             m2_service = get_m2_service()
             
-            # EMS에서 후보 트랙 조회
+            # EMS에서 후보 트랙 조회 (EMS는 공용)
             from sqlalchemy import text
             ems_query = text("""
                 SELECT t.track_id, t.title, t.artist, t.album, t.duration, t.external_metadata
                 FROM tracks t
                 JOIN playlist_tracks pt ON t.track_id = pt.track_id
                 JOIN playlists p ON pt.playlist_id = p.playlist_id
-                WHERE p.user_id = :user_id AND p.space_type = 'EMS'
+                WHERE p.space_type = 'EMS'
                 ORDER BY RAND()
                 LIMIT :limit
             """)
-            ems_result = db.execute(ems_query, {"user_id": user_id, "limit": ems_limit}).fetchall()
+            ems_result = db.execute(ems_query, {"limit": ems_limit}).fetchall()
             
             if not ems_result:
                 return {
@@ -593,7 +593,7 @@ async def unified_analyze(request: dict):
             # M2 분석 (SVM 학습)
             from M2.service import get_m2_service
             from sqlalchemy import text
-            
+
             m2_service = get_m2_service()
             
             # PMS에서 Positive 트랙 조회
@@ -625,18 +625,17 @@ async def unified_analyze(request: dict):
                     "message": f"PMS에 최소 5곡 이상 필요합니다 (현재: {len(positive_tracks)}곡)"
                 }
             
-            # EMS에서 Negative 트랙 샘플링
+            # EMS에서 Negative 트랙 샘플링 (EMS는 공용)
             ems_query = text("""
                 SELECT t.title, t.artist, t.album, t.duration
                 FROM tracks t
                 JOIN playlist_tracks pt ON t.track_id = pt.track_id
                 JOIN playlists p ON pt.playlist_id = p.playlist_id
-                WHERE p.user_id = :user_id AND p.space_type = 'EMS'
+                WHERE p.space_type = 'EMS'
                 ORDER BY RAND()
                 LIMIT :limit
             """)
             ems_result = db.execute(ems_query, {
-                "user_id": user_id, 
                 "limit": len(positive_tracks) * 3
             }).fetchall()
             
@@ -668,19 +667,20 @@ async def unified_analyze(request: dict):
             }
             
         elif model == "M3":
-            # M3 분석 (CatBoost 학습 및 추천)
+            # M3 분석 (CatBoost 학습만)
             from M3.service import get_m3_service
-            
+
             m3_service = get_m3_service()
-            result = m3_service.analyze_and_save_gms(db, user_id, top_k=50)
-            
+
+            # 모델 학습
+            train_result = m3_service.train_user_model(db, user_id)
+
             return {
-                "success": result.get("success", False),
+                "success": train_result.get("success", False),
                 "model": "M3",
                 "user_id": user_id,
-                "message": result.get("message", "M3 CatBoost 모델 분석 완료"),
-                "playlist_id": result.get("playlist_id"),
-                "count": result.get("count", 0)
+                "message": train_result.get("message", "M3 CatBoost 모델 학습 완료"),
+                "model_path": train_result.get("model_path")
             }
             
         else:
@@ -883,16 +883,16 @@ async def cart_analysis(request: CartAnalysisRequest):
             from M2.service import get_m2_service
             m2_service = get_m2_service()
             
-            # EMS 플레이리스트 트랙 조회
+            # EMS 플레이리스트 트랙 조회 (EMS는 공용)
             ems_query = text("""
                 SELECT t.track_id, t.title, t.artist, t.album, t.duration, t.external_metadata
                 FROM tracks t
                 JOIN playlist_tracks pt ON t.track_id = pt.track_id
                 JOIN playlists p ON pt.playlist_id = p.playlist_id
-                WHERE p.user_id = :user_id AND p.space_type = 'EMS'
+                WHERE p.space_type = 'EMS'
                 LIMIT 1000
             """)
-            ems_result = db.execute(ems_query, {"user_id": user_id}).fetchall()
+            ems_result = db.execute(ems_query).fetchall()
             
             if not ems_result:
                 return {
